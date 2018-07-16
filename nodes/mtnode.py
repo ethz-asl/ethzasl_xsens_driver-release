@@ -2,6 +2,7 @@
 import roslib; roslib.load_manifest('xsens_driver')
 import rospy
 import select
+import sys
 
 import mtdevice
 import mtdef
@@ -13,9 +14,10 @@ from geometry_msgs.msg import TwistStamped, PointStamped
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 import time
 import datetime
+import calendar
 
 # transform Euler angles or matrix into quaternions
-from math import radians, sqrt
+from math import radians, sqrt, atan2
 from tf.transformations import quaternion_from_matrix, quaternion_from_euler,\
     identity_matrix
 
@@ -31,15 +33,32 @@ def get_param(name, default):
     return v
 
 
+def get_param_list(name, default):
+    value = get_param(name, default)
+    if len(default) != len(value):
+        rospy.logfatal("Parameter %s should be a list of size %d", name, len(default))
+        sys.exit(1)
+    return value
+
+
+def matrix_from_diagonal(diagonal):
+    n = len(diagonal)
+    matrix = [0] * n * n
+    for i in range(0, n):
+        matrix[i*n + i] = diagonal[i]
+    return tuple(matrix)
+
+
 class XSensDriver(object):
 
     def __init__(self):
-
         device = get_param('~device', 'auto')
         baudrate = get_param('~baudrate', 0)
         timeout = get_param('~timeout', 0.002)
+        initial_wait = get_param('~initial_wait', 0.1)
         if device == 'auto':
-            devs = mtdevice.find_devices()
+            devs = mtdevice.find_devices(timeout=timeout,
+                                         initial_wait=initial_wait)
             if devs:
                 device, baudrate = devs[0]
                 rospy.loginfo("Detected MT device on port %s @ %d bps"
@@ -49,14 +68,16 @@ class XSensDriver(object):
                 rospy.signal_shutdown("Could not find proper MT device.")
                 return
         if not baudrate:
-            baudrate = mtdevice.find_baudrate(device)
+            baudrate = mtdevice.find_baudrate(device, timeout=timeout,
+                                              initial_wait=initial_wait)
         if not baudrate:
             rospy.logerr("Fatal: could not find proper baudrate.")
             rospy.signal_shutdown("Could not find proper baudrate.")
             return
 
         rospy.loginfo("MT node interface: %s at %d bd." % (device, baudrate))
-        self.mt = mtdevice.MTDevice(device, baudrate, timeout)
+        self.mt = mtdevice.MTDevice(device, baudrate, timeout,
+                                    initial_wait=initial_wait)
 
         # optional no rotation procedure for internal calibration of biases
         # (only mark iv devices)
@@ -71,6 +92,16 @@ class XSensDriver(object):
 
         self.frame_local = get_param('~frame_local', 'ENU')
 
+        self.angular_velocity_covariance = matrix_from_diagonal(
+            get_param_list('~angular_velocity_covariance_diagonal', [radians(0.025)] * 3)
+        )
+        self.linear_acceleration_covariance = matrix_from_diagonal(
+            get_param_list('~linear_acceleration_covariance_diagonal', [0.0004] * 3)
+        )
+        self.orientation_covariance = matrix_from_diagonal(
+            get_param_list("~orientation_covariance_diagonal", [radians(1.), radians(1.), radians(9.)])
+        )
+
         self.diag_msg = DiagnosticArray()
         self.stest_stat = DiagnosticStatus(name='mtnode: Self Test', level=1,
                                            message='No status information')
@@ -83,9 +114,10 @@ class XSensDriver(object):
         # publishers created at first use to reduce topic clutter
         self.diag_pub = None
         self.imu_pub = None
-        self.gps_pub = None
+        self.raw_gps_pub = None
         self.vel_pub = None
         self.mag_pub = None
+        self.pos_gps_pub = None
         self.temp_pub = None
         self.press_pub = None
         self.analog_in1_pub = None  # decide type+header
@@ -97,6 +129,8 @@ class XSensDriver(object):
 
         # publish a string version of all data; to be parsed by clients
         self.str_pub = rospy.Publisher('imu_data_str', String, queue_size=10)
+        self.last_delta_q_time = None
+        self.delta_q_rate = None
 
     def reset_vars(self):
         self.imu_msg = Imu()
@@ -104,8 +138,10 @@ class XSensDriver(object):
         self.imu_msg.angular_velocity_covariance = (-1., )*9
         self.imu_msg.linear_acceleration_covariance = (-1., )*9
         self.pub_imu = False
-        self.gps_msg = NavSatFix()
-        self.pub_gps = False
+        self.raw_gps_msg = NavSatFix()
+        self.pub_raw_gps = False
+        self.pos_gps_msg = NavSatFix()
+        self.pub_pos_gps = False
         self.vel_msg = TwistStamped()
         self.pub_vel = False
         self.mag_msg = MagneticField()
@@ -220,9 +256,9 @@ class XSensDriver(object):
             start_of_week = stamp_day - datetime.timedelta(days=iso_day)
             # stamp at the millisecond precision
             stamp_ms = start_of_week + datetime.timedelta(milliseconds=itow)
-            secs = time.mktime((stamp_ms.year, stamp_ms.month, stamp_ms.day,
-                                stamp_ms.hour, stamp_ms.minute,
-                                stamp_ms.second, 0, 0, -1))
+            secs = calendar.timegm((stamp_ms.year, stamp_ms.month, stamp_ms.day,
+                                    stamp_ms.hour, stamp_ms.minute,
+                                    stamp_ms.second, 0, 0, -1))
             nsecs = stamp_ms.microsecond * 1000 + ns
             if nsecs < 0:  # ns can be negative
                 secs -= 1
@@ -239,11 +275,11 @@ class XSensDriver(object):
         def fill_from_RAWGPS(rawgps_data):
             '''Fill messages with information from 'rawgps' MTData block.'''
             if rawgps_data['bGPS'] < self.old_bGPS:
-                self.pub_gps = True
+                self.pub_raw_gps = True
                 # LLA
-                self.gps_msg.latitude = rawgps_data['LAT']*1e-7
-                self.gps_msg.longitude = rawgps_data['LON']*1e-7
-                self.gps_msg.altitude = rawgps_data['ALT']*1e-3
+                self.raw_gps_msg.latitude = rawgps_data['LAT']*1e-7
+                self.raw_gps_msg.longitude = rawgps_data['LON']*1e-7
+                self.raw_gps_msg.altitude = rawgps_data['ALT']*1e-3
                 # NED vel # TODO?
             self.old_bGPS = rawgps_data['bGPS']
 
@@ -262,10 +298,7 @@ class XSensDriver(object):
                 self.imu_msg.angular_velocity.x = x
                 self.imu_msg.angular_velocity.y = y
                 self.imu_msg.angular_velocity.z = z
-                self.imu_msg.angular_velocity_covariance = (
-                    radians(0.025), 0., 0.,
-                    0., radians(0.025), 0.,
-                    0., 0., radians(0.025))
+                self.imu_msg.angular_velocity_covariance = self.angular_velocity_covariance
                 self.pub_vel = True
                 self.vel_msg.twist.angular.x = x
                 self.vel_msg.twist.angular.y = y
@@ -279,9 +312,7 @@ class XSensDriver(object):
                 self.imu_msg.linear_acceleration.x = x
                 self.imu_msg.linear_acceleration.y = y
                 self.imu_msg.linear_acceleration.z = z
-                self.imu_msg.linear_acceleration_covariance = (0.0004, 0., 0.,
-                                                               0., 0.0004, 0.,
-                                                               0., 0., 0.0004)
+                self.imu_msg.linear_acceleration_covariance = self.linear_acceleration_covariance
             except KeyError:
                 pass
             try:
@@ -312,9 +343,7 @@ class XSensDriver(object):
             self.imu_msg.orientation.y = y
             self.imu_msg.orientation.z = z
             self.imu_msg.orientation.w = w
-            self.imu_msg.orientation_covariance = (radians(1.), 0., 0.,
-                                                   0., radians(1.), 0.,
-                                                   0., 0., radians(9.))
+            self.imu_msg.orientation_covariance = self.orientation_covariance
 
         def fill_from_Auxiliary(aux_data):
             '''Fill messages with information from 'Auxiliary' MTData block.'''
@@ -331,10 +360,10 @@ class XSensDriver(object):
 
         def fill_from_Pos(position_data):
             '''Fill messages with information from 'position' MTData block.'''
-            self.pub_gps = True
-            self.gps_msg.latitude = position_data['Lat']
-            self.gps_msg.longitude = position_data['Lon']
-            self.gps_msg.altitude = position_data['Alt']
+            self.pub_pos_gps = True
+            self.pos_gps_msg.latitude = position_data['Lat']
+            self.pos_gps_msg.longitude = position_data['Lon']
+            self.pos_gps_msg.altitude = position_data['Alt']
 
         def fill_from_Vel(velocity_data):
             '''Fill messages with information from 'velocity' MTData block.'''
@@ -364,13 +393,19 @@ class XSensDriver(object):
             if status & 0b0100:
                 self.gps_stat.level = DiagnosticStatus.OK
                 self.gps_stat.message = "Ok"
-                self.gps_msg.status.status = NavSatStatus.STATUS_FIX
-                self.gps_msg.status.service = NavSatStatus.SERVICE_GPS
+                self.raw_gps_msg.status.status = NavSatStatus.STATUS_FIX
+                self.raw_gps_msg.status.service = NavSatStatus.SERVICE_GPS
+                # we borrow the status from the raw gps for pos_gps_msg
+                self.pos_gps_msg.status.status = NavSatStatus.STATUS_FIX
+                self.pos_gps_msg.status.service = NavSatStatus.SERVICE_GPS
             else:
                 self.gps_stat.level = DiagnosticStatus.WARN
                 self.gps_stat.message = "No fix"
-                self.gps_msg.status.status = NavSatStatus.STATUS_NO_FIX
-                self.gps_msg.status.service = 0
+                self.raw_gps_msg.status.status = NavSatStatus.STATUS_NO_FIX
+                self.raw_gps_msg.status.service = 0
+                # we borrow the status from the raw gps for pos_gps_msg
+                self.pos_gps_msg.status.status = NavSatStatus.STATUS_NO_FIX
+                self.pos_gps_msg.status.service = 0
 
         def fill_from_Sample(ts):
             '''Catch 'Sample' MTData blocks.'''
@@ -390,7 +425,7 @@ class XSensDriver(object):
                 y, m, d, hr, mi, s, ns, f = o['Year'], o['Month'], o['Day'],\
                     o['Hour'], o['Minute'], o['Second'], o['ns'], o['Flags']
                 if f & 0x4:
-                    secs = time.mktime((y, m, d, hr, mi, s, 0, 0, 0))
+                    secs = calendar.timegm((y, m, d, hr, mi, s, 0, 0, 0))
                     publish_time_ref(secs, ns, 'UTC time')
             except KeyError:
                 pass
@@ -402,8 +437,9 @@ class XSensDriver(object):
                 pass
             try:
                 sample_time_fine = o['SampleTimeFine']
-                secs = int(sample_time_fine / 1000)
-                nsecs = 1e6 * (sample_time_fine % 1000)
+                # int in 10kHz ticks
+                secs = int(sample_time_fine / 10000)
+                nsecs = 1e5 * (sample_time_fine % 10000)
                 publish_time_ref(secs, nsecs, 'sample time fine')
             except KeyError:
                 pass
@@ -442,9 +478,7 @@ class XSensDriver(object):
             self.imu_msg.orientation.y = y
             self.imu_msg.orientation.z = z
             self.imu_msg.orientation.w = w
-            self.imu_msg.orientation_covariance = (radians(1.), 0., 0.,
-                                                   0., radians(1.), 0.,
-                                                   0., 0., radians(9.))
+            self.imu_msg.orientation_covariance = self.orientation_covariance
 
         def fill_from_Pressure(o):
             '''Fill messages with information from 'Pressure' MTData2 block.'''
@@ -473,19 +507,17 @@ class XSensDriver(object):
             self.imu_msg.linear_acceleration.x = x
             self.imu_msg.linear_acceleration.y = y
             self.imu_msg.linear_acceleration.z = z
-            self.imu_msg.linear_acceleration_covariance = (0.0004, 0., 0.,
-                                                           0., 0.0004, 0.,
-                                                           0., 0., 0.0004)
+            self.imu_msg.linear_acceleration_covariance = self.linear_acceleration_covariance
 
         def fill_from_Position(o):
             '''Fill messages with information from 'Position' MTData2 block.'''
             try:
-                self.gps_msg.latitude = o['lat']
-                self.gps_msg.longitude = o['lon']
-                self.pub_gps = True
+                self.pos_gps_msg.latitude = o['lat']
+                self.pos_gps_msg.longitude = o['lon']
                 # altMsl is deprecated
                 alt = o.get('altEllipsoid', o.get('altMsl', 0))
-                self.gps_msg.altitude = alt
+                self.pos_gps_msg.altitude = alt
+                self.pub_pos_gps = True
             except KeyError:
                 pass
             try:
@@ -510,16 +542,17 @@ class XSensDriver(object):
                 # flags
                 fixtype = o['fixtype']
                 if fixtype == 0x00:
-                    self.gps_msg.status.status = NavSatStatus.STATUS_NO_FIX  # no fix
-                    self.gps_msg.status.service = 0
+                    self.raw_gps_msg.status.status = NavSatStatus.STATUS_NO_FIX  # no fix
+                    self.raw_gps_msg.status.service = 0
                 else:
-                    self.gps_msg.status.status = NavSatStatus.STATUS_FIX  # unaugmented
-                    self.gps_msg.status.service = NavSatStatus.SERVICE_GPS
+                    self.raw_gps_msg.status.status = NavSatStatus.STATUS_FIX  # unaugmented
+                    self.raw_gps_msg.status.service = NavSatStatus.SERVICE_GPS
                 # lat lon alt
-                self.gps_msg.latitude = o['lat']
-                self.gps_msg.longitude = o['lon']
-                self.gps_msg.altitude = o['height']/1e3
-                self.pub_gps = True
+                self.raw_gps_msg.latitude = o['lat']
+                self.raw_gps_msg.longitude = o['lon']
+                self.raw_gps_msg.altitude = o['height']/1e3
+                # TODO should we separate raw_gps and GNSS?
+                self.pub_raw_gps = True
                 # TODO velocity?
                 # TODO 2D heading?
                 # TODO DOP?
@@ -531,15 +564,53 @@ class XSensDriver(object):
             '''Fill messages with information from 'Angular Velocity' MTData2
             block.'''
             try:
+                dqw, dqx, dqy, dqz = convert_quat(
+                    (o['Delta q0'], o['Delta q1'], o['Delta q2'],
+                     o['Delta q3']),
+                    o['frame'])
+                now = rospy.Time.now()
+                if self.last_delta_q_time is None:
+                    self.last_delta_q_time = now
+                else:
+                    # update rate (filtering needed to account for lag variance)
+                    delta_t = (now - self.last_delta_q_time).to_sec()
+                    if self.delta_q_rate is None:
+                        self.delta_q_rate = 1./delta_t
+                    delta_t_filtered = .95/self.delta_q_rate + .05*delta_t
+                    # rate in necessarily integer
+                    self.delta_q_rate = round(1./delta_t_filtered)
+                    self.last_delta_q_time = now
+                    # relationship between \Delta q and velocity \bm{\omega}:
+                    # \bm{w} = \Delta t . \bm{\omega}
+                    # \theta = |\bm{w}|
+                    # \Delta q = [cos{\theta/2}, sin{\theta/2)/\theta . \bm{\omega}
+                    # extract rotation angle over delta_t
+                    ca_2, sa_2 = dqw, sqrt(dqx**2 + dqy**2 + dqz**2)
+                    ca = ca_2**2 - sa_2**2
+                    sa = 2*ca_2*sa_2
+                    rotation_angle = atan2(sa, ca)
+                    # compute rotation velocity
+                    rotation_speed = rotation_angle * self.delta_q_rate
+                    f = rotation_speed / sa_2
+                    x, y, z = f*dqx, f*dqy, f*dqz
+                    self.imu_msg.angular_velocity.x = x
+                    self.imu_msg.angular_velocity.y = y
+                    self.imu_msg.angular_velocity.z = z
+                    self.imu_msg.angular_velocity_covariance = self.angular_velocity_covariance
+                    self.pub_imu = True
+                    self.vel_msg.twist.angular.x = x
+                    self.vel_msg.twist.angular.y = y
+                    self.vel_msg.twist.angular.z = z
+                    self.pub_vel = True
+            except KeyError:
+                pass
+            try:
                 x, y, z = convert_coords(o['gyrX'], o['gyrY'], o['gyrZ'],
                                          o['frame'])
                 self.imu_msg.angular_velocity.x = x
                 self.imu_msg.angular_velocity.y = y
                 self.imu_msg.angular_velocity.z = z
-                self.imu_msg.angular_velocity_covariance = (
-                    radians(0.025), 0., 0.,
-                    0., radians(0.025), 0.,
-                    0., 0., radians(0.025))
+                self.imu_msg.angular_velocity_covariance = self.angular_velocity_covariance
                 self.pub_imu = True
                 self.vel_msg.twist.angular.x = x
                 self.vel_msg.twist.angular.y = y
@@ -547,7 +618,6 @@ class XSensDriver(object):
                 self.pub_vel = True
             except KeyError:
                 pass
-            # TODO decide what to do with 'Delta q'
 
         def fill_from_GPS(o):
             '''Fill messages with information from 'GPS' MTData2 block.'''
@@ -660,11 +730,16 @@ class XSensDriver(object):
             if self.imu_pub is None:
                 self.imu_pub = rospy.Publisher('imu/data', Imu, queue_size=10)
             self.imu_pub.publish(self.imu_msg)
-        if self.pub_gps:
-            self.gps_msg.header = self.h
-            if self.gps_pub is None:
-                self.gps_pub = rospy.Publisher('fix', NavSatFix, queue_size=10)
-            self.gps_pub.publish(self.gps_msg)
+        if self.pub_raw_gps:
+            self.raw_gps_msg.header = self.h
+            if self.raw_gps_pub is None:
+                self.raw_gps_pub = rospy.Publisher('raw_fix', NavSatFix, queue_size=10)
+            self.raw_gps_pub.publish(self.raw_gps_msg)
+        if self.pub_pos_gps:
+            self.pos_gps_msg.header = self.h
+            if self.pos_gps_pub is None:
+                self.pos_gps_pub = rospy.Publisher('fix', NavSatFix, queue_size=10)
+            self.pos_gps_pub.publish(self.pos_gps_msg)
         if self.pub_vel:
             self.vel_msg.header = self.h
             if self.vel_pub is None:
