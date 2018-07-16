@@ -1,3 +1,26 @@
+## xsens_driver (melodic) - 2.2.0-0
+
+The packages in the `xsens_driver` repository were released into the `melodic` distro by running `/usr/bin/bloom-release xsens_driver --track melodic --rosdistro melodic --new-track` on `Mon, 16 Jul 2018 15:29:21 -0000`
+
+The `xsens_driver` package was released.
+
+Version of package(s) in repository `xsens_driver`:
+
+- upstream repository: https://github.com/ethz-asl/ethzasl_xsens_driver.git
+- release repository: unknown
+- rosdistro version: `null`
+- old version: `null`
+- new version: `2.2.0-0`
+
+Versions of tools used:
+
+- bloom version: `0.6.6`
+- catkin_pkg version: `0.4.6`
+- rosdep version: `0.12.2`
+- rosdistro version: `0.5.0`
+- vcstools version: `0.1.40`
+
+
 ## xsens_driver (lunar) - 2.2.0-0
 
 The packages in the `xsens_driver` repository were released into the `lunar` distro by running `/usr/bin/bloom-release xsens_driver --track lunar --rosdistro lunar` on `Mon, 16 Jul 2018 15:25:29 -0000`
